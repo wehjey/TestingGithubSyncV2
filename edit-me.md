@@ -16,4 +16,4 @@ Merge the PR on Github. The article should now be changed on Intercom
 The current version number is 1. When you edit, bump it so the change is easy  
 to spot on the Intercom side.
 
-common man
+common man?
