@@ -1,0 +1,174 @@
+name: Intercom docs sync auto-merge
+
+# intercom-gitsync-automerge
+# Managed by Intercom. Approves and squash-merges the sync app's outbound
+# pull requests. Runs as github-actions[bot], a different identity from the
+# sync app, so it can satisfy a required-review rule the app cannot.
+# Removing this file turns the behaviour off.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  # Sync pull requests opened before this file landed never fired an `opened`
+  # event, and merging the file does not replay one. Sweep them once here.
+  push:
+    branches: [main]
+    paths: [.github/workflows/intercom-docs-sync-automerge.yml]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: >-
+      github.event_name == 'push'
+      || github.event.pull_request.user.id == 280359669
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+      BOT_USER_ID: 280359669
+      # A JSON array in a quoted scalar: a folder name can hold any character,
+      # including a newline, without escaping its way out into the workflow.
+      MANAGED_FOLDERS: '[""]'
+      # The sync app opens setup, configuration and bulk content sync pull
+      # requests too, and those are meant for a human. Only the branch it mints
+      # for a single article's proposed change is eligible here.
+      SUGGESTION_BRANCH_PATTERN: '^intercom/suggestion/article_content-[0-9]+(-v[0-9]+)?$'
+      RESERVED_FOLDER: '.github'
+    steps:
+      - name: Collect candidate pull requests
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            gh api --paginate "repos/$REPO/pulls?state=open" \
+              --jq ".[] | select(.user.id == $BOT_USER_ID) | .number" \
+              > "$RUNNER_TEMP/prs.txt"
+          else
+            echo "$PR_NUMBER" > "$RUNNER_TEMP/prs.txt"
+          fi
+
+      - name: Approve and merge the ones inside a managed folder
+        run: |
+          set -euo pipefail
+
+          eligible() {
+            pr="$1"
+            meta="$RUNNER_TEMP/pr-$pr.json"
+            gh api "repos/$REPO/pulls/$pr" > "$meta"
+
+            if [ "$(jq -r '.user.id' "$meta")" != "$BOT_USER_ID" ]; then
+              echo "PR #$pr was not opened by the sync app."
+              return 1
+            fi
+
+            if [ "$(jq -r '.draft' "$meta")" != "false" ]; then
+              echo "PR #$pr is a draft."
+              return 1
+            fi
+
+            # A fork can carry any branch name, so the name only means
+            # something on a branch of this repository.
+            if [ "$(jq -r '.head.repo.full_name // ""' "$meta")" != "$REPO" ]; then
+              echo "PR #$pr comes from a fork."
+              return 1
+            fi
+
+            # [[ =~ ]] anchors to the whole string; grep would treat an embedded
+            # newline as a second line and match on the safe half alone.
+            head_ref="$(jq -r '.head.ref' "$meta")"
+            if [[ ! "$head_ref" =~ $SUGGESTION_BRANCH_PATTERN ]]; then
+              echo "PR #$pr is not from a single-article branch."
+              return 1
+            fi
+
+            return 0
+          }
+
+          # An empty entry is a target managing the whole repo from its root,
+          # which puts every path in scope.
+          has_root_folder=$(printf '%s' "$MANAGED_FOLDERS" | jq -r 'any(. == "")')
+
+          # A rename touches two paths, so the old one is checked as well.
+          in_scope() {
+            pr="$1"
+            meta="$RUNNER_TEMP/pr-$pr.json"
+            files="$RUNNER_TEMP/files-$pr.txt"
+            gh api --paginate "repos/$REPO/pulls/$pr/files" \
+              --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' > "$files"
+
+            if [ ! -s "$files" ]; then
+              echo "PR #$pr changes no files."
+              return 1
+            fi
+
+            # That endpoint stops at 3000 files, so a longer pull request would
+            # hide its out-of-scope paths past the cap.
+            listed=$(wc -l < "$files")
+            declared=$(jq -r '.changed_files' "$meta")
+            if [ "$listed" -ne "$declared" ]; then
+              echo "PR #$pr lists $listed of $declared changed files; cannot confirm scope."
+              return 1
+            fi
+
+            result=0
+            while IFS=$'\t' read -r file previous; do
+              for path in "$file" "$previous"; do
+                [ -z "$path" ] && continue
+
+                # A managed folder is never allowed to cover this, but a stale
+                # workflow file could still carry one that does. CI config is
+                # what grants the merge, so it is refused whatever the list says.
+                case "$path" in
+                  "$RESERVED_FOLDER"/*)
+                    echo "PR #$pr touches $RESERVED_FOLDER: $path"
+                    result=1
+                    continue
+                    ;;
+                esac
+
+                matched=false
+                if [ "$has_root_folder" = "true" ]; then
+                  matched=true
+                else
+                  while IFS= read -r prefix; do
+                    [ -z "$prefix" ] && continue
+                    case "$path" in
+                      "$prefix"/*) matched=true; break ;;
+                    esac
+                  done < <(printf '%s' "$MANAGED_FOLDERS" | jq -r '.[]')
+                fi
+
+                if [ "$matched" != "true" ]; then
+                  echo "PR #$pr touches a path outside every managed folder: $path"
+                  result=1
+                fi
+              done
+            done < "$files"
+
+            return $result
+          }
+
+          while IFS= read -r pr; do
+            [ -z "$pr" ] && continue
+
+            if ! eligible "$pr" || ! in_scope "$pr"; then
+              echo "Skipping #$pr."
+              continue
+            fi
+
+            gh pr review --approve "$pr" --repo "$REPO"
+
+            # `--auto` needs "Allow auto-merge" on the repository; without it
+            # this falls back to merging now, which only works once checks have
+            # passed. Both failing is a hard error on purpose — a silent stall
+            # is worse.
+            if ! gh pr merge --squash --auto "$pr" --repo "$REPO"; then
+              echo "Could not arm auto-merge for #$pr; trying to merge now."
+              echo "Enable 'Allow auto-merge' in this repository's settings so the" \
+                   "merge waits for required checks instead of needing them green already."
+              gh pr merge --squash "$pr" --repo "$REPO"
+            fi
+          done < "$RUNNER_TEMP/prs.txt"
